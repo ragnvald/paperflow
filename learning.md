@@ -85,3 +85,8 @@
 - **Use**: Local virtual environment path is `/home/ragnvald/code/paperflow/.venv`.
 - **Install**: Python dependencies are pinned in `/home/ragnvald/code/paperflow/requirements.txt`.
 - **Depend**: Current third-party module set is `ttkbootstrap` with `pillow` (GUI script also requires system `tkinter` runtime).
+
+## Object: paperflow API token file
+- **Default path**: API token file defaults to `/home/ragnvald/code/paperflow/secrets/paperlesstoken.api`.
+- **Fallback**: Legacy token path `/home/ragnvald/code/secrets/paperlesstoken.api` is still read when repo-local token file is absent.
+- **Template**: Commit `/home/ragnvald/code/paperflow/secrets/paperlesstoken.api.template` and keep real token file gitignored.

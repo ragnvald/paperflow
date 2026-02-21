@@ -17,3 +17,11 @@ If you do not activate the venv, run scripts with `.venv/bin/python`.
 - `init_ocr_tracking_db.py`: initialize/sync OCR tracking SQLite from the Paperless API.
 - `run_archiver_by_ids.py`: run `document_archiver` per document id and write analysis reports.
 - `ocr_tracking_dashboard.py`: desktop dashboard for OCR rerun flows.
+
+## API token file
+- Template (committed): `secrets/paperlesstoken.api.template`
+- Real token file (gitignored): `secrets/paperlesstoken.api`
+
+Setup:
+1. `cp secrets/paperlesstoken.api.template secrets/paperlesstoken.api`
+2. Replace the placeholder with your Paperless API token only (single line).

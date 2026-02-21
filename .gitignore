@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 data_out/
 data_memory/
+
+# Keep a committed secrets template, but ignore real secret files.
+secrets/*
+!secrets/*.template
+!secrets/.gitkeep

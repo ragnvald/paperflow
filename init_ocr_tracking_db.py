@@ -16,7 +16,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_DIR = SCRIPT_DIR / "data_memory"
 DEFAULT_DB_PATH = DEFAULT_DB_DIR / "paperless_ocr_tracking.sqlite3"
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
-DEFAULT_TOKEN_FILE = SCRIPT_DIR.parent / "secrets" / "paperlesstoken.api"
+DEFAULT_TOKEN_FILE = SCRIPT_DIR / "secrets" / "paperlesstoken.api"
+LEGACY_TOKEN_FILE = SCRIPT_DIR.parent / "secrets" / "paperlesstoken.api"
 
 RUN_TYPES = ("bootstrap", "sync", "ocr-rerun")
 
@@ -55,9 +56,12 @@ def normalize_token_header(token: str) -> str:
 
 
 def read_token_file(path: Path) -> str:
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8").strip()
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    # Backward-compatible fallback for older layout where secrets lived one level up.
+    if path == DEFAULT_TOKEN_FILE and LEGACY_TOKEN_FILE.exists():
+        return LEGACY_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return ""
 
 
 def api_get_json(url: str, headers: dict[str, str], verify_tls: bool, timeout: int) -> dict | list:
