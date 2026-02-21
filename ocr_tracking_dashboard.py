@@ -66,6 +66,7 @@ class OcrDashboard(tb.Window):
         self.selected_candidates: list[dict] = []
         self.low_text_rows: list[dict] = []
         self.prospective_rows: list[dict] = []
+        self.pdf_search_rows: list[dict] = []
         self.run_total = 0
         self.run_completed_ids: set[int] = set()
         self.run_started_ids: set[int] = set()
@@ -98,16 +99,19 @@ class OcrDashboard(tb.Window):
         self.tab_low = tb.Frame(self.notebook, padding=8)
         self.tab_success = tb.Frame(self.notebook, padding=8)
         self.tab_prospective = tb.Frame(self.notebook, padding=8)
+        self.tab_pdf_search = tb.Frame(self.notebook, padding=8)
 
         self.notebook.add(self.tab_run, text="Run OCR")
         self.notebook.add(self.tab_low, text="Suspicious Low Text")
         self.notebook.add(self.tab_success, text="Successful OCR")
         self.notebook.add(self.tab_prospective, text="Prospective Reruns")
+        self.notebook.add(self.tab_pdf_search, text="Search PDFs")
 
         self._build_run_tab()
         self._build_low_text_tab()
         self._build_success_tab()
         self._build_prospective_tab()
+        self._build_pdf_search_tab()
 
     def _build_top_controls(self, parent: tk.Widget) -> None:
         top = tb.Labelframe(parent, text="API + General Settings", padding=8)
@@ -202,10 +206,10 @@ class OcrDashboard(tb.Window):
         tb.Label(self.tab_run, textvariable=self.run_summary, bootstyle="secondary").pack(anchor=W, pady=(8, 6))
         tb.Label(
             self.tab_run,
-            text="OCR-kjøring skjer via Paperless API (bulk reprocess + task polling).",
+            text="OCR runs are executed via the Paperless API (bulk reprocess + task polling).",
             bootstyle="info",
         ).pack(anchor=W, pady=(0, 6))
-        self.progress_text = tk.StringVar(value="Fremdrift: 0/0 (0%) | På vent: 0")
+        self.progress_text = tk.StringVar(value="Progress: 0/0 (0%) | Pending: 0")
         tb.Label(self.tab_run, textvariable=self.progress_text, bootstyle="info").pack(anchor=W, pady=(0, 4))
         self.progress_value = tk.DoubleVar(value=0.0)
         tb.Progressbar(
@@ -293,6 +297,75 @@ class OcrDashboard(tb.Window):
         )
         self._update_control_states()
 
+    def _build_pdf_search_tab(self) -> None:
+        filters_row_1 = tb.Frame(self.tab_pdf_search)
+        filters_row_1.pack(fill=X)
+
+        self.pdf_query = tk.StringVar(value="")
+        self.pdf_modified_contains = tk.StringVar(value="")
+        self.pdf_missing_archive_only = tk.BooleanVar(value=False)
+        self.pdf_exclude_recent_days = tk.StringVar(value="0")
+
+        tb.Label(filters_row_1, text="Search").pack(side=LEFT, padx=(0, 6))
+        tb.Entry(filters_row_1, textvariable=self.pdf_query, width=28).pack(side=LEFT, padx=(0, 12))
+
+        tb.Label(filters_row_1, text="Modified contains").pack(side=LEFT, padx=(0, 6))
+        tb.Entry(filters_row_1, textvariable=self.pdf_modified_contains, width=18).pack(side=LEFT, padx=(0, 12))
+
+        tb.Checkbutton(
+            filters_row_1,
+            text="Missing archive only",
+            variable=self.pdf_missing_archive_only,
+            bootstyle="round-toggle",
+        ).pack(side=LEFT, padx=(0, 12))
+
+        tb.Label(filters_row_1, text="Exclude OCR last days").pack(side=LEFT, padx=(0, 6))
+        tb.Entry(filters_row_1, textvariable=self.pdf_exclude_recent_days, width=6).pack(side=LEFT, padx=(0, 12))
+
+        filters_row_2 = tb.Frame(self.tab_pdf_search)
+        filters_row_2.pack(fill=X, pady=(8, 0))
+
+        self.pdf_min_chars = tk.StringVar(value="")
+        self.pdf_max_chars = tk.StringVar(value="")
+        self.pdf_min_pages = tk.StringVar(value="")
+        self.pdf_max_pages = tk.StringVar(value="")
+
+        tb.Label(filters_row_2, text="Chars min").pack(side=LEFT, padx=(0, 6))
+        tb.Entry(filters_row_2, textvariable=self.pdf_min_chars, width=8).pack(side=LEFT, padx=(0, 12))
+
+        tb.Label(filters_row_2, text="Chars max").pack(side=LEFT, padx=(0, 6))
+        tb.Entry(filters_row_2, textvariable=self.pdf_max_chars, width=8).pack(side=LEFT, padx=(0, 12))
+
+        tb.Label(filters_row_2, text="Pages min").pack(side=LEFT, padx=(0, 6))
+        tb.Entry(filters_row_2, textvariable=self.pdf_min_pages, width=8).pack(side=LEFT, padx=(0, 12))
+
+        tb.Label(filters_row_2, text="Pages max").pack(side=LEFT, padx=(0, 6))
+        tb.Entry(filters_row_2, textvariable=self.pdf_max_pages, width=8).pack(side=LEFT, padx=(0, 12))
+
+        tb.Button(filters_row_2, text="Search PDFs", command=self.refresh_pdf_search, bootstyle="info").pack(
+            side=LEFT, padx=(0, 8)
+        )
+        tb.Button(filters_row_2, text="Reset Filters", command=self.reset_pdf_search_filters, bootstyle="secondary").pack(
+            side=LEFT, padx=(0, 8)
+        )
+        self.transfer_pdf_to_run_button = tb.Button(
+            filters_row_2,
+            text="Transfer to Run OCR",
+            command=self.transfer_pdf_search_to_run,
+            bootstyle="primary",
+        )
+        self.transfer_pdf_to_run_button.pack(side=LEFT)
+
+        self.pdf_summary = tk.StringVar(value="No data loaded")
+        tb.Label(self.tab_pdf_search, textvariable=self.pdf_summary, bootstyle="secondary").pack(anchor=W, pady=(8, 6))
+
+        self.pdf_tree = self._build_tree(
+            self.tab_pdf_search,
+            columns=("id", "title", "content_length", "page_count", "modified", "archive_filename", "original_filename"),
+            headings=("ID", "Title", "Chars", "Pages", "Modified", "Archive file", "Original file"),
+        )
+        self._update_control_states()
+
     def _build_tree(self, parent: tk.Widget, columns: tuple[str, ...], headings: tuple[str, ...]) -> ttk.Treeview:
         frame = tb.Frame(parent)
         frame.pack(fill=BOTH, expand=True)
@@ -313,6 +386,8 @@ class OcrDashboard(tb.Window):
             width = 120
             if col in ("title", "reason"):
                 width = 420
+            elif col in ("archive_filename", "original_filename"):
+                width = 320
             elif col in ("modified", "last_manual_ocr", "run_ts"):
                 width = 180
             tree.column(col, width=width, anchor="e")
@@ -405,7 +480,7 @@ class OcrDashboard(tb.Window):
         pending = max(total - completed, 0)
         percent = (completed / total * 100.0) if total > 0 else 0.0
         self.progress_value.set(percent)
-        self.progress_text.set(f"Fremdrift: {completed}/{total} ({percent:.0f}%) | På vent: {pending}")
+        self.progress_text.set(f"Progress: {completed}/{total} ({percent:.0f}%) | Pending: {pending}")
 
     def _update_progress_from_log_line(self, line: str) -> None:
         if line.startswith("[START]"):
@@ -447,6 +522,12 @@ class OcrDashboard(tb.Window):
         if val < minimum:
             raise ValueError(f"{field} must be >= {minimum}")
         return val
+
+    def _safe_optional_int(self, raw: str, field: str, minimum: int = 0) -> int | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        return self._safe_int(text, field, minimum=minimum)
 
     def _api_headers(self, token: str) -> dict[str, str]:
         return {
@@ -728,6 +809,7 @@ class OcrDashboard(tb.Window):
                 self.after(0, self.refresh_low_text)
                 self.after(0, self.refresh_success_tab)
                 self.after(0, self.refresh_prospective)
+                self.after(0, self.refresh_pdf_search)
                 self._emit("=== DATA REFRESH END ===\n")
             except Exception as exc:
                 self._emit(f"[ERROR] Refresh failed: {exc}\n")
@@ -914,6 +996,7 @@ class OcrDashboard(tb.Window):
         if self.docs:
             self.refresh_candidates()
             self.refresh_prospective()
+            self.refresh_pdf_search()
         self._emit(
             f"[INFO] Refreshed API OCR archive only: success_rows={len(self.success_rows)} failed_rows={len(self.failed_rows)}\n"
         )
@@ -1002,6 +1085,195 @@ class OcrDashboard(tb.Window):
             self.transfer_to_run_button.configure(
                 state=("disabled" if self.api_run_active else "normal")
             )
+        if hasattr(self, "transfer_pdf_to_run_button"):
+            self.transfer_pdf_to_run_button.configure(
+                state=("disabled" if self.api_run_active else "normal")
+            )
+
+    def refresh_pdf_search(self) -> None:
+        if not self.docs:
+            self.pdf_summary.set("No documents loaded. Click Refresh All Data.")
+            self._fill_tree(self.pdf_tree, [])
+            self.pdf_search_rows = []
+            return
+
+        try:
+            min_chars = self._safe_optional_int(self.pdf_min_chars.get(), "Chars min", minimum=0)
+            max_chars = self._safe_optional_int(self.pdf_max_chars.get(), "Chars max", minimum=0)
+            min_pages = self._safe_optional_int(self.pdf_min_pages.get(), "Pages min", minimum=0)
+            max_pages = self._safe_optional_int(self.pdf_max_pages.get(), "Pages max", minimum=0)
+            exclude_recent_days = self._safe_optional_int(
+                self.pdf_exclude_recent_days.get(), "Exclude OCR last days", minimum=0
+            )
+            exclude_recent_days = 0 if exclude_recent_days is None else exclude_recent_days
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc))
+            return
+
+        if min_chars is not None and max_chars is not None and max_chars < min_chars:
+            messagebox.showerror("Invalid input", "Chars max must be >= chars min")
+            return
+        if min_pages is not None and max_pages is not None and max_pages < min_pages:
+            messagebox.showerror("Invalid input", "Pages max must be >= pages min")
+            return
+
+        query = self.pdf_query.get().strip().lower()
+        modified_contains = self.pdf_modified_contains.get().strip().lower()
+        missing_archive_only = self.pdf_missing_archive_only.get()
+
+        history_rows = self.success_rows + self.failed_rows
+        recent_ids = (
+            self._recent_manual_ocr_ids(history_rows, within_days=exclude_recent_days)
+            if exclude_recent_days > 0
+            else set()
+        )
+
+        pdf_docs = [d for d in self.docs if str(d.get("mime_type") or "").lower() == "application/pdf"]
+        filtered: list[dict] = []
+
+        for d in pdf_docs:
+            doc_id = int(d.get("id") or 0)
+            if recent_ids and doc_id in recent_ids:
+                continue
+
+            title = str(d.get("title") or "")
+            archive_filename = str(d.get("archive_filename") or "")
+            original_filename = str(d.get("original_filename") or "")
+            modified = str(d.get("modified") or "")
+            content_length = int(d.get("content_length") or 0)
+
+            page_count_raw = d.get("page_count")
+            if page_count_raw is None:
+                page_count = None
+            else:
+                try:
+                    page_count = int(page_count_raw)
+                except (TypeError, ValueError):
+                    page_count = None
+
+            if query:
+                haystack = " ".join(
+                    [
+                        str(doc_id),
+                        title,
+                        archive_filename,
+                        original_filename,
+                        modified,
+                    ]
+                ).lower()
+                if query not in haystack:
+                    continue
+
+            if modified_contains and modified_contains not in modified.lower():
+                continue
+            if missing_archive_only and archive_filename.strip():
+                continue
+            if min_chars is not None and content_length < min_chars:
+                continue
+            if max_chars is not None and content_length > max_chars:
+                continue
+            if min_pages is not None and (page_count is None or page_count < min_pages):
+                continue
+            if max_pages is not None and (page_count is None or page_count > max_pages):
+                continue
+
+            filtered.append(
+                {
+                    "id": doc_id,
+                    "title": title,
+                    "content_length": content_length,
+                    "page_count": page_count,
+                    "modified": modified,
+                    "archive_filename": archive_filename,
+                    "original_filename": original_filename,
+                }
+            )
+
+        filtered.sort(key=lambda row: (row["content_length"], row["id"]))
+        self.pdf_search_rows = filtered
+
+        rows = [
+            (
+                row["id"],
+                row["title"],
+                row["content_length"],
+                row["page_count"] if row["page_count"] is not None else "",
+                row["modified"],
+                row["archive_filename"],
+                row["original_filename"],
+            )
+            for row in filtered
+        ]
+        self._fill_tree(self.pdf_tree, rows)
+        self.pdf_summary.set(
+            "PDF results: "
+            f"{len(filtered)} of {len(pdf_docs)} PDF docs "
+            f"(exclude_recent_days={exclude_recent_days})"
+        )
+
+    def reset_pdf_search_filters(self) -> None:
+        self.pdf_query.set("")
+        self.pdf_modified_contains.set("")
+        self.pdf_missing_archive_only.set(False)
+        self.pdf_exclude_recent_days.set("0")
+        self.pdf_min_chars.set("")
+        self.pdf_max_chars.set("")
+        self.pdf_min_pages.set("")
+        self.pdf_max_pages.set("")
+        self.refresh_pdf_search()
+
+    def transfer_pdf_search_to_run(self) -> None:
+        if self.api_run_active:
+            messagebox.showinfo(
+                "Run in progress",
+                "Transfer is disabled while an OCR job is running.",
+            )
+            return
+        if not self.docs:
+            messagebox.showinfo("No data", "No documents loaded. Click Refresh All Data.")
+            return
+
+        selected_items = self.pdf_tree.selection()
+        if not selected_items:
+            messagebox.showinfo(
+                "No selection",
+                "Select one or more rows in Search PDFs first.",
+            )
+            return
+
+        selected_ids: list[int] = []
+        for item_id in selected_items:
+            values = self.pdf_tree.item(item_id, "values")
+            if not values:
+                continue
+            try:
+                selected_ids.append(int(values[0]))
+            except (TypeError, ValueError):
+                continue
+
+        if not selected_ids:
+            messagebox.showinfo("No valid IDs", "Could not parse selected document IDs.")
+            return
+
+        docs_by_id = {int(d["id"]): d for d in self.pdf_search_rows}
+        transfer_docs: list[dict] = []
+        for doc_id in selected_ids:
+            doc = docs_by_id.get(doc_id)
+            if doc is not None:
+                transfer_docs.append(doc)
+
+        if not transfer_docs:
+            messagebox.showinfo("Not found", "Selected IDs were not found in current PDF search result.")
+            return
+
+        self._set_run_candidates(
+            transfer_docs,
+            f"Transferred {len(transfer_docs)} document(s) from Search PDFs.",
+        )
+        self.notebook.select(self.tab_run)
+        self._emit(
+            f"[INFO] Transferred to Run OCR from Search PDFs: ids={','.join(str(d['id']) for d in transfer_docs)}\n"
+        )
 
     def transfer_prospective_to_run(self) -> None:
         if self.api_run_active:
