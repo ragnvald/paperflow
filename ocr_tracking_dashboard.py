@@ -34,13 +34,12 @@ from init_ocr_tracking_db import (  # type: ignore
     read_token_file,
 )
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_MEMORY_DIR = SCRIPT_DIR / "data_memory"
-DATA_OUT_DIR = SCRIPT_DIR / "data_out"
+DATA_MEMORY_DIR = Path("data_memory")
+DATA_OUT_DIR = Path("data_out")
 API_OCR_HISTORY_PATH = DATA_MEMORY_DIR / "api_ocr_history.jsonl"
 PIPELINE_DB_PATH = DATA_MEMORY_DIR / "ocr_pipeline.sqlite3"
 RAG_INGESTION_ROOT = DATA_OUT_DIR / "rag_ingestion"
-DEFAULT_LLM_KEY_FILE = SCRIPT_DIR / "secrets" / "openai.api"
+DEFAULT_LLM_KEY_FILE = Path("secrets") / "openai.api"
 
 BATCH_OPTIONS = tuple([str(i) for i in range(5, 101, 5)] + ["250", "500", "1000"])
 TASK_POLL_INTERVAL_SECONDS = 2.0

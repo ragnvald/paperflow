@@ -87,12 +87,11 @@
 - **Depend**: Current third-party module set is `ttkbootstrap` with `pillow` (GUI script also requires system `tkinter` runtime).
 
 ## Object: paperflow API token file
-- **Default path**: API token file defaults to `/home/ragnvald/code/paperflow/secrets/paperlesstoken.api`.
-- **Fallback**: Legacy token path `/home/ragnvald/code/secrets/paperlesstoken.api` is still read when repo-local token file is absent.
-- **Template**: Commit `/home/ragnvald/code/paperflow/secrets/paperlesstoken.api.template` and keep real token file gitignored.
+- **Default path**: API token file defaults to `secrets/paperlesstoken.api` (relative to current working directory).
+- **Template**: Commit `secrets/paperlesstoken.api.template` and keep real token file gitignored.
 
 ## Object: OCR pipeline working data
-- **Store**: Dashboard working state/events are persisted in `/home/ragnvald/code/paperflow/data_memory/ocr_pipeline.sqlite3`.
-- **Store**: Dashboard runtime log is `/home/ragnvald/code/paperflow/data_memory/dashboard.log`.
-- **Store**: OCR run history archive jsonl is `/home/ragnvald/code/paperflow/data_memory/api_ocr_history.jsonl`.
-- **Export**: RAG ingestion files are exported on request to `/home/ragnvald/code/paperflow/data_out/rag_ingestion/<engine>/<doc_id>/` as `.md`/`.json`.
+- **Store**: Dashboard working state/events are persisted in `data_memory/ocr_pipeline.sqlite3` (relative to current working directory).
+- **Store**: Dashboard runtime log is `data_memory/dashboard.log` (relative to current working directory).
+- **Store**: OCR run history archive jsonl is `data_memory/api_ocr_history.jsonl` (relative to current working directory).
+- **Export**: RAG ingestion files are exported on request to `data_out/rag_ingestion/<engine>/<doc_id>/` as `.md`/`.json` (relative to current working directory).
