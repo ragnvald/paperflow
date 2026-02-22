@@ -90,3 +90,9 @@
 - **Default path**: API token file defaults to `/home/ragnvald/code/paperflow/secrets/paperlesstoken.api`.
 - **Fallback**: Legacy token path `/home/ragnvald/code/secrets/paperlesstoken.api` is still read when repo-local token file is absent.
 - **Template**: Commit `/home/ragnvald/code/paperflow/secrets/paperlesstoken.api.template` and keep real token file gitignored.
+
+## Object: OCR pipeline working data
+- **Store**: Dashboard working state/events are persisted in `/home/ragnvald/code/paperflow/data_memory/ocr_pipeline.sqlite3`.
+- **Store**: Dashboard runtime log is `/home/ragnvald/code/paperflow/data_memory/dashboard.log`.
+- **Store**: OCR run history archive jsonl is `/home/ragnvald/code/paperflow/data_memory/api_ocr_history.jsonl`.
+- **Export**: RAG ingestion files are exported on request to `/home/ragnvald/code/paperflow/data_out/rag_ingestion/<engine>/<doc_id>/` as `.md`/`.json`.
