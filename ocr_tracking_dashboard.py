@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import re
+import socket
 import sqlite3
 import ssl
 import threading
@@ -40,6 +41,10 @@ API_OCR_HISTORY_PATH = DATA_MEMORY_DIR / "api_ocr_history.jsonl"
 PIPELINE_DB_PATH = DATA_MEMORY_DIR / "ocr_pipeline.sqlite3"
 RAG_INGESTION_ROOT = DATA_OUT_DIR / "rag_ingestion"
 DEFAULT_LLM_KEY_FILE = Path("secrets") / "openai.api"
+LEGACY_LLM_KEY_FILE = Path("secrets") / "openai.token"
+DEFAULT_LLM_TIMEOUT_SECONDS = 180
+DEFAULT_LLM_RETRY_ATTEMPTS = 2
+LLM_RETRY_BACKOFF_SECONDS = 2.0
 
 BATCH_OPTIONS = tuple([str(i) for i in range(5, 101, 5)] + ["250", "500", "1000"])
 TASK_POLL_INTERVAL_SECONDS = 2.0
@@ -60,6 +65,7 @@ class OcrDashboard(tb.Window):
 
         self.run_thread: threading.Thread | None = None
         self.api_run_active = False
+        self.export_active = False
         self.stop_event = threading.Event()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.log_file_lock = threading.Lock()
@@ -85,6 +91,9 @@ class OcrDashboard(tb.Window):
         self.run_total = 0
         self.run_completed_ids: set[int] = set()
         self.run_started_ids: set[int] = set()
+        self.progress_scope = "Idle"
+        self.progress_text = tk.StringVar(value="Idle | 0/0 (0%) | Pending: 0")
+        self.progress_value = tk.DoubleVar(value=0.0)
         self.tree_sort_state: dict[str, dict[str, bool]] = {}
         self._ensure_pipeline_schema()
 
@@ -98,7 +107,7 @@ class OcrDashboard(tb.Window):
         root.pack(fill=BOTH, expand=True)
 
         self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill=BOTH, expand=True, pady=(0, 4))
+        self.notebook.pack(fill=BOTH, expand=True, pady=(0, 6))
 
         self.tab_run = tb.Frame(self.notebook, padding=8)
         self.tab_pdf_search = tb.Frame(self.notebook, padding=8)
@@ -127,6 +136,18 @@ class OcrDashboard(tb.Window):
         self._build_top_controls(self.tab_settings)
         self.log = ScrolledText(self.tab_log, wrap="word")
         self.log.pack(fill=BOTH, expand=True)
+
+        status_row = tb.Frame(root)
+        status_row.pack(fill=X, pady=(0, 2))
+        tb.Label(status_row, text="Activity", bootstyle="secondary").pack(side=LEFT, padx=(0, 8))
+        tb.Label(status_row, textvariable=self.progress_text, bootstyle="secondary").pack(side=LEFT, padx=(0, 10))
+        tb.Progressbar(
+            status_row,
+            variable=self.progress_value,
+            maximum=100.0,
+            mode="determinate",
+            bootstyle="success-striped",
+        ).pack(side=LEFT, fill=X, expand=True)
 
     def _build_top_controls(self, parent: tk.Widget) -> None:
         top = tb.Frame(parent)
@@ -159,6 +180,8 @@ class OcrDashboard(tb.Window):
         self.llm_api_base_url = tk.StringVar(value="https://api.openai.com")
         self.llm_api_key = tk.StringVar(value="")
         self.llm_model = tk.StringVar(value="gpt-4.1-mini")
+        self.llm_timeout = tk.StringVar(value=str(DEFAULT_LLM_TIMEOUT_SECONDS))
+        self.llm_retry_attempts = tk.StringVar(value=str(DEFAULT_LLM_RETRY_ATTEMPTS))
         self.llm_mode = tk.StringVar(value=LLM_MODE_RESPONSES)
         self.llm_prompt = tk.StringVar(
             value=(
@@ -171,22 +194,24 @@ class OcrDashboard(tb.Window):
         self._add_form_row(llm_frame, 0, "LLM Base URL", self.llm_api_base_url)
         self._add_form_row(llm_frame, 1, "LLM API Key (optional)", self.llm_api_key, show="*")
         self._add_form_row(llm_frame, 2, "Model", self.llm_model)
-        self._add_form_row(llm_frame, 3, "Prompt", self.llm_prompt)
+        self._add_form_row(llm_frame, 3, "LLM Timeout (s)", self.llm_timeout)
+        self._add_form_row(llm_frame, 4, "Retry attempts", self.llm_retry_attempts)
+        self._add_form_row(llm_frame, 5, "Prompt", self.llm_prompt)
 
-        tb.Label(llm_frame, text="API mode").grid(row=4, column=0, sticky=W, padx=6, pady=4)
+        tb.Label(llm_frame, text="API mode").grid(row=6, column=0, sticky=W, padx=6, pady=4)
         tb.Combobox(
             llm_frame,
             values=(LLM_MODE_RESPONSES, LLM_MODE_CHAT),
             textvariable=self.llm_mode,
             state="readonly",
             width=22,
-        ).grid(row=4, column=1, sticky=W, padx=6, pady=4)
+        ).grid(row=6, column=1, sticky=W, padx=6, pady=4)
         tb.Checkbutton(
             llm_frame,
             text="Update Paperless content after successful LLM OCR",
             variable=self.llm_update_paperless,
             bootstyle="round-toggle",
-        ).grid(row=5, column=1, sticky=W, padx=6, pady=4)
+        ).grid(row=7, column=1, sticky=W, padx=6, pady=4)
         llm_frame.columnconfigure(1, weight=1)
 
         export_frame = tb.Labelframe(top, text="RAG Export", padding=8)
@@ -325,9 +350,7 @@ class OcrDashboard(tb.Window):
             bootstyle="info",
         ).pack(anchor=W, pady=(0, 6))
 
-        self.progress_text = tk.StringVar(value="Progress: 0/0 (0%) | Pending: 0")
         tb.Label(self.tab_run, textvariable=self.progress_text, bootstyle="info").pack(anchor=W, pady=(0, 4))
-        self.progress_value = tk.DoubleVar(value=0.0)
         tb.Progressbar(
             self.tab_run,
             variable=self.progress_value,
@@ -725,7 +748,13 @@ class OcrDashboard(tb.Window):
         pending = max(total - completed, 0)
         percent = (completed / total * 100.0) if total > 0 else 0.0
         self.progress_value.set(percent)
-        self.progress_text.set(f"Progress: {completed}/{total} ({percent:.0f}%) | Pending: {pending}")
+        self.progress_text.set(
+            f"{self.progress_scope} | {completed}/{total} ({percent:.0f}%) | Pending: {pending}"
+        )
+
+    def _set_progress_scope(self, scope: str) -> None:
+        self.progress_scope = scope
+        self._render_progress()
 
     def _update_progress_from_log_line(self, line: str) -> None:
         if line.startswith("[START]"):
@@ -955,7 +984,10 @@ class OcrDashboard(tb.Window):
         env_token = os.environ.get("OPENAI_API_KEY", "").strip()
         if env_token:
             return env_token
-        return read_token_file(DEFAULT_LLM_KEY_FILE)
+        key = read_token_file(DEFAULT_LLM_KEY_FILE)
+        if key:
+            return key
+        return read_token_file(LEGACY_LLM_KEY_FILE)
 
     def _llm_headers(self, api_key: str) -> dict[str, str]:
         return {
@@ -971,25 +1003,47 @@ class OcrDashboard(tb.Window):
         payload: dict,
         verify_tls: bool,
         timeout: int,
+        retry_attempts: int = 0,
     ) -> dict | list:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url=url, headers=headers, method="POST", data=body)
         context = None
         if not verify_tls:
             context = ssl._create_unverified_context()  # noqa: S323
-        try:
-            with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
-                raw = resp.read().decode("utf-8")
-                if not raw.strip():
-                    return {}
-                return json.loads(raw)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} for {url}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Network error for {url}: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"LLM API returned non-JSON response for {url}") from exc
+        attempts = max(1, retry_attempts + 1)
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+                    raw = resp.read().decode("utf-8")
+                    if not raw.strip():
+                        return {}
+                    return json.loads(raw)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if 500 <= exc.code < 600 and attempt < attempts:
+                    self._emit(
+                        f"[WARN]  LLM API HTTP {exc.code} (attempt {attempt}/{attempts}), retrying...\n"
+                    )
+                    time.sleep(LLM_RETRY_BACKOFF_SECONDS * attempt)
+                    continue
+                raise RuntimeError(f"HTTP {exc.code} for {url}: {detail}") from exc
+            except (TimeoutError, socket.timeout) as exc:
+                if attempt < attempts:
+                    self._emit(f"[WARN]  LLM API timeout (attempt {attempt}/{attempts}), retrying...\n")
+                    time.sleep(LLM_RETRY_BACKOFF_SECONDS * attempt)
+                    continue
+                raise RuntimeError(f"Network timeout for {url}: {exc}") from exc
+            except urllib.error.URLError as exc:
+                if attempt < attempts:
+                    self._emit(
+                        f"[WARN]  LLM API network error (attempt {attempt}/{attempts}): {exc}. Retrying...\n"
+                    )
+                    time.sleep(LLM_RETRY_BACKOFF_SECONDS * attempt)
+                    continue
+                raise RuntimeError(f"Network error for {url}: {exc}") from exc
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"LLM API returned non-JSON response for {url}") from exc
+        raise RuntimeError(f"LLM API request exhausted retries for {url}")
 
     def _extract_llm_text(self, payload: dict | list) -> str:
         if isinstance(payload, dict):
@@ -1038,11 +1092,24 @@ class OcrDashboard(tb.Window):
         if not api_key:
             raise RuntimeError(
                 "Missing LLM API key. Provide it in UI, set OPENAI_API_KEY, or put it in "
-                f"{DEFAULT_LLM_KEY_FILE}"
+                f"{DEFAULT_LLM_KEY_FILE} (legacy fallback: {LEGACY_LLM_KEY_FILE})"
             )
         model = self.llm_model.get().strip()
         if not model:
             raise RuntimeError("LLM model is required")
+        try:
+            llm_timeout = self._safe_int(self.llm_timeout.get().strip(), "LLM Timeout", minimum=5)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        try:
+            llm_retry_attempts = self._safe_int(
+                self.llm_retry_attempts.get().strip(),
+                "Retry attempts",
+                minimum=0,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        effective_timeout = max(timeout, llm_timeout)
 
         llm_base = normalize_base_url(self.llm_api_base_url.get().strip())
         prompt = self.llm_prompt.get().strip()
@@ -1092,7 +1159,8 @@ class OcrDashboard(tb.Window):
             headers=headers,
             payload=payload,
             verify_tls=verify_tls,
-            timeout=timeout,
+            timeout=effective_timeout,
+            retry_attempts=llm_retry_attempts,
         )
         return self._extract_llm_text(raw)
 
@@ -1789,6 +1857,12 @@ class OcrDashboard(tb.Window):
         self._export_documents_to_rag(selected_doc_ids)
 
     def _export_documents_to_rag(self, doc_ids: list[int]) -> None:
+        if self.export_active:
+            messagebox.showinfo("Export in progress", "A RAG export job is already running.")
+            return
+        if self.api_run_active:
+            messagebox.showinfo("OCR in progress", "Wait for the active OCR run to finish before exporting.")
+            return
         token = self._get_token()
         if not token:
             messagebox.showerror(
@@ -1803,91 +1877,137 @@ class OcrDashboard(tb.Window):
             return
 
         source_mode = self.export_source_mode.get().strip() or ENGINE_PAPERLESS
+        export_format = self.export_format_mode.get().strip() or "both"
         base_url = normalize_base_url(self.api_base_url.get().strip())
         headers = self._api_headers(token)
         verify_tls = self.verify_tls.get()
 
+        self.run_total = len(doc_ids)
+        self.run_completed_ids = set()
+        self.run_started_ids = set()
+        self._set_progress_scope("RAG Export")
+        self._render_progress()
+        self.stop_event.clear()
+        self.export_active = True
+        self._update_control_states()
+        self._emit("\n=== RAG EXPORT QUEUED ===\n")
+        self._emit(f"Source mode: {source_mode}\n")
+        self._emit(f"Format: {export_format}\n")
+        self._emit("IDs: " + ",".join(str(x) for x in doc_ids) + "\n")
+        self.run_thread = threading.Thread(
+            target=self._export_documents_to_rag_worker,
+            args=(doc_ids, source_mode, export_format, base_url, headers, timeout, verify_tls),
+            daemon=True,
+        )
+        self.run_thread.start()
+
+    def _export_documents_to_rag_worker(
+        self,
+        doc_ids: list[int],
+        source_mode: str,
+        export_format: str,
+        base_url: str,
+        headers: dict[str, str],
+        timeout: int,
+        verify_tls: bool,
+    ) -> None:
         self._emit(f"\n=== RAG EXPORT START source={source_mode} docs={len(doc_ids)} ===\n")
         ok_count = 0
         fail_count = 0
-        for doc_id in doc_ids:
-            title = f"Document {doc_id}"
-            try:
-                if source_mode == ENGINE_LLM:
-                    llm_data = self._load_latest_llm_text(doc_id)
-                    if llm_data is None:
-                        raise RuntimeError("No successful LLM OCR output found in pipeline database")
-                    text, title, llm_meta = llm_data
-                    metadata = {"source_mode": ENGINE_LLM, **llm_meta}
-                    if not text.strip():
-                        raise RuntimeError("Latest LLM OCR output exists but text is empty")
-                else:
-                    raw_doc = self._fetch_document_raw_by_id(
-                        base_url=base_url,
-                        headers=headers,
+        try:
+            for doc_id in doc_ids:
+                if self.stop_event.is_set():
+                    self._emit("[STOP] Export loop stopped by user\n")
+                    break
+                self._emit(f"[START] ID={doc_id}\n")
+                title = f"Document {doc_id}"
+                try:
+                    if source_mode == ENGINE_LLM:
+                        llm_data = self._load_latest_llm_text(doc_id)
+                        if llm_data is None:
+                            raise RuntimeError(
+                                "No successful LLM OCR output found in local pipeline DB. "
+                                "Run OCR with engine 'llm_openai_compatible' first, "
+                                "or export using source 'paperless_internal'."
+                            )
+                        text, title, llm_meta = llm_data
+                        metadata = {"source_mode": ENGINE_LLM, **llm_meta}
+                        if not text.strip():
+                            raise RuntimeError("Latest LLM OCR output exists but text is empty")
+                    else:
+                        raw_doc = self._fetch_document_raw_by_id(
+                            base_url=base_url,
+                            headers=headers,
+                            doc_id=doc_id,
+                            timeout=timeout,
+                            verify_tls=verify_tls,
+                        )
+                        title = str(raw_doc.get("title") or title)
+                        text = str(raw_doc.get("content") or "")
+                        metadata = {
+                            "source_mode": ENGINE_PAPERLESS,
+                            "modified": raw_doc.get("modified"),
+                            "mime_type": raw_doc.get("mime_type"),
+                            "archive_filename": raw_doc.get("archive_filename") or raw_doc.get("archived_file_name"),
+                            "original_filename": raw_doc.get("original_filename") or raw_doc.get("original_file_name"),
+                        }
+                        if not text.strip():
+                            raise RuntimeError("Paperless content is empty for this document")
+
+                    md_path, json_path = self._write_rag_export_files(
                         doc_id=doc_id,
-                        timeout=timeout,
-                        verify_tls=verify_tls,
+                        title=title,
+                        engine=source_mode,
+                        text=text,
+                        metadata=metadata,
                     )
-                    title = str(raw_doc.get("title") or title)
-                    text = str(raw_doc.get("content") or "")
-                    metadata = {
-                        "source_mode": ENGINE_PAPERLESS,
-                        "modified": raw_doc.get("modified"),
-                        "mime_type": raw_doc.get("mime_type"),
-                        "archive_filename": raw_doc.get("archive_filename") or raw_doc.get("archived_file_name"),
-                        "original_filename": raw_doc.get("original_filename") or raw_doc.get("original_file_name"),
-                    }
-                    if not text.strip():
-                        raise RuntimeError("Paperless content is empty for this document")
-
-                md_path, json_path = self._write_rag_export_files(
-                    doc_id=doc_id,
-                    title=title,
-                    engine=source_mode,
-                    text=text,
-                    metadata=metadata,
-                )
-                self._record_pipeline_event(
-                    doc_id=doc_id,
-                    title=title,
-                    action="rag_export",
-                    engine=source_mode,
-                    status="success",
-                    note=f"export_format={self.export_format_mode.get()}",
-                    rag_md_path=md_path,
-                    rag_json_path=json_path,
-                    text_sha256=self._text_sha256(text),
-                )
-                self._emit(
-                    f"[OK]    ID={doc_id} exported to RAG "
-                    f"(md={md_path or '-'}, json={json_path or '-'})\n"
-                )
-                ok_count += 1
-            except Exception as exc:
-                self._record_pipeline_event(
-                    doc_id=doc_id,
-                    title=title,
-                    action="rag_export",
-                    engine=source_mode,
-                    status="failed",
-                    note=str(exc),
-                )
-                self._emit(f"[FAIL]  ID={doc_id} export failed: {exc}\n")
-                fail_count += 1
-
-        self._emit(f"Summary: rag_export success={ok_count} failed={fail_count} total={len(doc_ids)}\n")
-        self._emit("=== RAG EXPORT END ===\n")
-        self.refresh_pipeline_overview()
+                    self._record_pipeline_event(
+                        doc_id=doc_id,
+                        title=title,
+                        action="rag_export",
+                        engine=source_mode,
+                        status="success",
+                        note=f"export_format={export_format}",
+                        rag_md_path=md_path,
+                        rag_json_path=json_path,
+                        text_sha256=self._text_sha256(text),
+                    )
+                    self._emit(
+                        f"[OK]    ID={doc_id} exported to RAG "
+                        f"(md={md_path or '-'}, json={json_path or '-'})\n"
+                    )
+                    ok_count += 1
+                except Exception as exc:
+                    self._record_pipeline_event(
+                        doc_id=doc_id,
+                        title=title,
+                        action="rag_export",
+                        engine=source_mode,
+                        status="failed",
+                        note=str(exc),
+                    )
+                    self._emit(f"[FAIL]  ID={doc_id} export failed: {exc}\n")
+                    fail_count += 1
+        except Exception as exc:
+            self._emit(f"[ERROR] RAG export worker crashed: {exc}\n")
+        finally:
+            self._emit(f"Summary: rag_export success={ok_count} failed={fail_count} total={len(doc_ids)}\n")
+            self._emit("=== RAG EXPORT END ===\n")
+            self.export_active = False
+            self.after(0, self._update_control_states)
+            self.after(0, self.refresh_pipeline_overview)
+            self.after(0, self._set_progress_scope, "Idle")
+            self.after(0, self._render_progress)
 
     def _update_control_states(self) -> None:
+        disabled = self.api_run_active or self.export_active
         if hasattr(self, "transfer_to_run_button"):
             self.transfer_to_run_button.configure(
-                state=("disabled" if self.api_run_active else "normal")
+                state=("disabled" if disabled else "normal")
             )
         if hasattr(self, "transfer_pdf_to_run_button"):
             self.transfer_pdf_to_run_button.configure(
-                state=("disabled" if self.api_run_active else "normal")
+                state=("disabled" if disabled else "normal")
             )
 
     def refresh_pdf_search(self) -> None:
@@ -2132,6 +2252,9 @@ class OcrDashboard(tb.Window):
         if not self.selected_candidates:
             messagebox.showinfo("No candidates", "No selected candidates. Build candidate list first.")
             return
+        if self.export_active:
+            messagebox.showinfo("Export in progress", "A RAG export job is active. Wait for it to finish first.")
+            return
         if self.api_run_active:
             messagebox.showinfo("Run in progress", "An OCR run is already active.")
             return
@@ -2192,6 +2315,10 @@ class OcrDashboard(tb.Window):
         self.run_total = len(ids)
         self.run_completed_ids = set()
         self.run_started_ids = set()
+        if engine_mode == ENGINE_LLM:
+            self._set_progress_scope("LLM OCR")
+        else:
+            self._set_progress_scope("Paperless OCR")
         self._render_progress()
         self.stop_event.clear()
         self.api_run_active = True
@@ -2285,6 +2412,12 @@ class OcrDashboard(tb.Window):
                         timeout=timeout,
                         verify_tls=verify_tls,
                     )
+                    self._emit(
+                        f"[INFO]  ID={doc_id} sending PDF to LLM API "
+                        f"(bytes={len(pdf_bytes)}, mode={self.llm_mode.get().strip() or LLM_MODE_RESPONSES}, "
+                        f"timeout={self.llm_timeout.get().strip() or DEFAULT_LLM_TIMEOUT_SECONDS}s, "
+                        f"retries={self.llm_retry_attempts.get().strip() or DEFAULT_LLM_RETRY_ATTEMPTS})\n"
+                    )
                     text = self._llm_ocr_pdf(
                         pdf_bytes=pdf_bytes,
                         filename=filename,
@@ -2366,6 +2499,7 @@ class OcrDashboard(tb.Window):
                 self.success_rows, self.failed_rows = self._load_api_history_rows()
                 self.after(0, self.refresh_success_tab)
             self.after(0, self.refresh_pipeline_overview)
+            self.after(0, self._set_progress_scope, "Idle")
             self.after(0, self._render_progress)
 
     def _run_api_reprocess_worker(
@@ -2574,14 +2708,18 @@ class OcrDashboard(tb.Window):
             self.success_rows, self.failed_rows = self._load_api_history_rows()
             self.after(0, self.refresh_success_tab)
             self.after(0, self.refresh_pipeline_overview)
-            self._render_progress()
+            self.after(0, self._set_progress_scope, "Idle")
+            self.after(0, self._render_progress)
 
     def stop_run(self) -> None:
-        if not self.api_run_active:
+        if not self.api_run_active and not self.export_active:
             self._emit("No active run to stop.\n")
             return
         self.stop_event.set()
-        self._emit("Stop requested. Current API task poll/submission will stop shortly.\n")
+        if self.api_run_active:
+            self._emit("Stop requested. Current API task poll/submission will stop shortly.\n")
+        if self.export_active:
+            self._emit("Stop requested. Current export job will stop shortly.\n")
         self._render_progress()
 
 
