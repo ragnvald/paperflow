@@ -1,4 +1,5 @@
 # paperflow
+<!-- Note: Updated with dashboard highlights and Windows build steps. -->
 `paperflow` is a practical OCR operations layer on top of Paperless-ngx.
 
 The project helps you inspect document OCR quality, rerun OCR with different engines, track what happened per document, and export clean text files for RAG ingestion.
@@ -25,6 +26,16 @@ This repo gives you a user-facing pipeline to:
 - `ocr_tracking_dashboard.py`: desktop control center for OCR + export workflow, including candidate selection, PDF filters, run history, logs, and progress.
 - `init_ocr_tracking_db.py`: API-driven sync tool that snapshots Paperless document state into SQLite; safe to run repeatedly.
 - `run_archiver_by_ids.py`: optional direct Paperless host script using `manage.py document_archiver` for local/server-side operations.
+
+## Dashboard highlights
+- Pipeline Run tab: build a candidate set (batch size + exclude recent OCR), then run OCR or export the selection.
+- Search PDFs tab: query across ID/title/filenames/modified, filter by missing archive, exclude recent OCR days, and char/page ranges; transfer results to Run OCR or export.
+- Low-Text Review tab: list documents below a character threshold for quick triage.
+- Prospective Reruns tab: detect low-text documents while excluding recent manual OCR; transfer selected docs to Run OCR.
+- Pipeline Overview tab: per-document OCR/export events with engine, status, and export paths.
+- OCR History tab: successful/failed API OCR runs loaded from `data_memory/api_ocr_history.jsonl`.
+- Activity Log tab: live log with persisted output in `data_memory/dashboard.log`.
+- Settings tab: configure API base URL, token, page size, timeout, TLS verify, LLM options, and RAG export targets.
 
 ## Data model and folders
 - `data_memory/`: persistent working state, including `paperless_ocr_tracking.sqlite3`, `ocr_pipeline.sqlite3`, and logs/history.
@@ -60,6 +71,40 @@ If you do not activate the venv, run scripts with `.venv/bin/python`.
 - Tk runtime for GUI scripts (`tkinter`; on Debian/Ubuntu install `python3-tk` if missing)
 - Python packages listed in `requirements.txt`
 
+## Windows app build
+Use the build script to compile `ocr_tracking_dashboard.py` into a Windows GUI app.
+
+1. Open PowerShell in the repo root.
+2. Run the build:
+```powershell
+.\build_windows.ps1
+```
+
+Output:
+- `dist\ocr_tracking_dashboard\ocr_tracking_dashboard.exe` (default folder build)
+
+If you prefer a `.bat` launcher:
+```bat
+build_windows.bat
+```
+
+Optional single-file build:
+```powershell
+.\build_windows.ps1 -OneFile
+```
+
+Output:
+- `dist\ocr_tracking_dashboard.exe`
+
+Batch equivalent:
+```bat
+build_windows.bat -OneFile
+```
+
+Notes:
+- Place your real API token at `secrets\paperlesstoken.api` next to the executable's working directory.
+- The app will create `data_memory\` and `data_out\` folders on first run.
+
 ## Paperless API token
 - Template (committed): `secrets/paperlesstoken.api.template`
 - Real token file (gitignored): `secrets/paperlesstoken.api`
@@ -74,9 +119,11 @@ Setup:
 - Additional supported source: `OPENAI_API_KEY` environment variable.
 - Additional supported source: `LLM API Key` field in dashboard settings.
 
-## LLM OCR network controls
-- Dashboard setting: `LLM Timeout (s)` default `180`.
-- Dashboard setting: `Retry attempts` default `2`.
+## LLM OCR options
+- Supports OpenAI-compatible base URLs and models.
+- API mode: `responses` or `chat_completions`.
+- Optional: update Paperless content after successful LLM OCR.
+- Network controls: `LLM Timeout (s)` default `180`, `Retry attempts` default `2`.
 
 These are separate from Paperless API timeout and are important for larger PDF uploads.
 

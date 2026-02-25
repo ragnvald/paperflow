@@ -1,4 +1,5 @@
 # Learning log
+<!-- Note: Added Windows build workflow info for paperflow. -->
 
 ## Object: paperless workspace
 - **Contain**: Workspace root is `/home/ragnvald/code`.
@@ -95,3 +96,8 @@
 - **Store**: Dashboard runtime log is `data_memory/dashboard.log` (relative to current working directory).
 - **Store**: OCR run history archive jsonl is `data_memory/api_ocr_history.jsonl` (relative to current working directory).
 - **Export**: RAG ingestion files are exported on request to `data_out/rag_ingestion/<engine>/<doc_id>/` as `.md`/`.json` (relative to current working directory).
+
+## Object: paperflow Windows build
+- **Build**: Run `build_windows.ps1` to compile `ocr_tracking_dashboard.py` into a Windows GUI app.
+- **Output**: Default output is `dist/ocr_tracking_dashboard/ocr_tracking_dashboard.exe`; optional `-OneFile` outputs `dist/ocr_tracking_dashboard.exe`.
+- **Launch**: `build_windows.bat` is a batch wrapper that invokes the PowerShell build with the same flags (for example `-OneFile`).
