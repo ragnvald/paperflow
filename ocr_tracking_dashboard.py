@@ -40,11 +40,13 @@ DATA_OUT_DIR = Path("data_out")
 API_OCR_HISTORY_PATH = DATA_MEMORY_DIR / "api_ocr_history.jsonl"
 PIPELINE_DB_PATH = DATA_MEMORY_DIR / "ocr_pipeline.sqlite3"
 RAG_INGESTION_ROOT = DATA_OUT_DIR / "rag_ingestion"
+DASHBOARD_SETTINGS_PATH = DATA_MEMORY_DIR / "ocr_dashboard_settings.json"
 DEFAULT_LLM_KEY_FILE = Path("secrets") / "openai.api"
 LEGACY_LLM_KEY_FILE = Path("secrets") / "openai.token"
 DEFAULT_LLM_TIMEOUT_SECONDS = 180
 DEFAULT_LLM_RETRY_ATTEMPTS = 2
 LLM_RETRY_BACKOFF_SECONDS = 2.0
+SETTINGS_AUTOSAVE_DELAY_MS = 500
 
 BATCH_OPTIONS = tuple([str(i) for i in range(5, 101, 5)] + ["250", "500", "1000"])
 TASK_POLL_INTERVAL_SECONDS = 2.0
@@ -55,13 +57,27 @@ ENGINE_PAPERLESS = "paperless_internal"
 ENGINE_LLM = "llm_openai_compatible"
 LLM_MODE_RESPONSES = "responses"
 LLM_MODE_CHAT = "chat_completions"
+DEFAULT_LLM_PROMPT_TEXT = (
+    "Extract all text from this PDF with high fidelity. "
+    "Return plain markdown optimized for RAG chunking with headings where meaningful."
+)
+SUCCESS_SORT_FIELDS = (
+    ("Run time", "run_ts"),
+    ("ID", "id"),
+    ("Title", "title"),
+    ("Pre chars", "pre_content_length"),
+    ("Post chars", "post_content_length"),
+    ("Delta", "content_delta"),
+    ("Status", "status"),
+)
+SUCCESS_SORT_ORDERS = ("Descending", "Ascending")
 
 
 class OcrDashboard(tb.Window):
     def __init__(self) -> None:
         super().__init__(themename="flatly")
         self.title("Paperless OCR Control Center")
-        self.geometry("1300x860")
+        self.geometry("1560x860")
 
         self.run_thread: threading.Thread | None = None
         self.api_run_active = False
@@ -74,9 +90,13 @@ class OcrDashboard(tb.Window):
         self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
         self.history_file_path = API_OCR_HISTORY_PATH
         self.pipeline_db_path = PIPELINE_DB_PATH
+        self.settings_file_path = DASHBOARD_SETTINGS_PATH
         self.rag_root_dir = RAG_INGESTION_ROOT
         self.pipeline_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.rag_root_dir.mkdir(parents=True, exist_ok=True)
+        self._settings_load_in_progress = False
+        self._settings_autosave_after_id: str | None = None
+        self.llm_api_mode_help_window: tk.Toplevel | None = None
 
         self.docs: list[dict] = []
         self.recent_manual_ids: set[int] = set()
@@ -84,7 +104,6 @@ class OcrDashboard(tb.Window):
         self.failed_rows: list[dict] = []
 
         self.selected_candidates: list[dict] = []
-        self.low_text_rows: list[dict] = []
         self.prospective_rows: list[dict] = []
         self.pdf_search_rows: list[dict] = []
         self.pipeline_rows: list[dict] = []
@@ -94,11 +113,15 @@ class OcrDashboard(tb.Window):
         self.progress_scope = "Idle"
         self.progress_text = tk.StringVar(value="Idle | 0/0 (0%) | Pending: 0")
         self.progress_value = tk.DoubleVar(value=0.0)
+        self.paperless_fetch_status = tk.StringVar(value="Paperless overview last fetched: never")
         self.tree_sort_state: dict[str, dict[str, bool]] = {}
         self._ensure_pipeline_schema()
 
         self._build_ui()
+        self._load_saved_settings()
+        self._register_settings_autosave()
         self.refresh_pipeline_overview()
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self._append_file_log(f"\n===== DASHBOARD START {dt.datetime.now().isoformat()} =====\n")
         self.after(100, self._drain_log_queue)
 
@@ -106,32 +129,34 @@ class OcrDashboard(tb.Window):
         root = tb.Frame(self, padding=10)
         root.pack(fill=BOTH, expand=True)
 
+        self._build_step1_controls(root)
+
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=BOTH, expand=True, pady=(0, 6))
 
         self.tab_run = tb.Frame(self.notebook, padding=8)
         self.tab_pdf_search = tb.Frame(self.notebook, padding=8)
-        self.tab_low = tb.Frame(self.notebook, padding=8)
         self.tab_prospective = tb.Frame(self.notebook, padding=8)
         self.tab_pipeline = tb.Frame(self.notebook, padding=8)
+        self.tab_rag = tb.Frame(self.notebook, padding=8)
         self.tab_success = tb.Frame(self.notebook, padding=8)
         self.tab_settings = tb.Frame(self.notebook, padding=8)
         self.tab_log = tb.Frame(self.notebook, padding=8)
 
         self.notebook.add(self.tab_run, text="Pipeline Run")
-        self.notebook.add(self.tab_pdf_search, text="Search PDFs")
-        self.notebook.add(self.tab_low, text="Low-Text Review")
+        self.notebook.add(self.tab_pdf_search, text="Search Documents")
         self.notebook.add(self.tab_prospective, text="Prospective Reruns")
         self.notebook.add(self.tab_pipeline, text="Pipeline Overview")
+        self.notebook.add(self.tab_rag, text="RAG")
         self.notebook.add(self.tab_success, text="OCR History")
         self.notebook.add(self.tab_settings, text="Settings")
         self.notebook.add(self.tab_log, text="Activity Log")
 
         self._build_run_tab()
         self._build_pdf_search_tab()
-        self._build_low_text_tab()
         self._build_prospective_tab()
         self._build_pipeline_tab()
+        self._build_rag_tab()
         self._build_success_tab()
         self._build_top_controls(self.tab_settings)
         self.log = ScrolledText(self.tab_log, wrap="word")
@@ -149,12 +174,58 @@ class OcrDashboard(tb.Window):
             bootstyle="success-striped",
         ).pack(side=LEFT, fill=X, expand=True)
 
+    def _build_step1_controls(self, parent: tk.Widget) -> None:
+        controls = tb.Labelframe(parent, text="Step 1: Candidate Set", padding=8)
+        controls.pack(fill=X, pady=(0, 8))
+
+        self.batch_size = tk.StringVar(value="50")
+        self.recent_days = tk.StringVar(value="14")
+
+        row = tb.Frame(controls)
+        row.pack(fill=X)
+
+        tb.Label(row, text="Batch size").pack(side=LEFT, padx=(0, 6))
+        tb.Combobox(row, values=BATCH_OPTIONS, textvariable=self.batch_size, state="readonly", width=8).pack(
+            side=LEFT, padx=(0, 12)
+        )
+        tb.Label(row, text="Exclude OCR in last days").pack(side=LEFT, padx=(0, 6))
+        tb.Entry(row, textvariable=self.recent_days, width=8).pack(side=LEFT, padx=(0, 12))
+        tb.Button(
+            row,
+            text="Fetch overview from Paperless",
+            bootstyle="primary",
+            command=self.refresh_all,
+        ).pack(side=LEFT, padx=(0, 8))
+        tb.Button(
+            row,
+            text="Rebuild candidates (loaded data)",
+            bootstyle="info",
+            command=self.refresh_candidates,
+        ).pack(side=LEFT, padx=(0, 8))
+
+        tb.Label(controls, textvariable=self.paperless_fetch_status, bootstyle="secondary").pack(anchor=W, pady=(8, 2))
+        tb.Label(
+            controls,
+            text=(
+                "Fetch overview from Paperless calls the API and refreshes the local overview. "
+                "Rebuild candidates only recalculates the run list from already loaded data."
+            ),
+            bootstyle="secondary",
+        ).pack(anchor=W)
+
     def _build_top_controls(self, parent: tk.Widget) -> None:
         top = tb.Frame(parent)
-        top.pack(fill=X)
+        top.pack(fill=BOTH, expand=True)
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(0, weight=1)
 
-        api_frame = tb.Labelframe(top, text="Paperless API", padding=8)
-        api_frame.pack(fill=X, pady=(0, 8))
+        settings_grid = tb.Frame(top)
+        settings_grid.grid(row=0, column=0, sticky="nsew")
+        settings_grid.columnconfigure(0, weight=1, uniform="settings_col")
+        settings_grid.columnconfigure(1, weight=1, uniform="settings_col")
+
+        api_frame = tb.Labelframe(settings_grid, text="Paperless API", padding=8)
+        api_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
         self.api_base_url = tk.StringVar(value=DEFAULT_API_BASE_URL)
         self.api_token = tk.StringVar(value="")
@@ -174,8 +245,8 @@ class OcrDashboard(tb.Window):
         ).grid(row=4, column=1, sticky=W, padx=6, pady=4)
         api_frame.columnconfigure(1, weight=1)
 
-        llm_frame = tb.Labelframe(top, text="LLM OCR (OpenAI-Compatible)", padding=8)
-        llm_frame.pack(fill=X, pady=(0, 8))
+        llm_frame = tb.Labelframe(settings_grid, text="LLM OCR (OpenAI-Compatible)", padding=8)
+        llm_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
         self.llm_api_base_url = tk.StringVar(value="https://api.openai.com")
         self.llm_api_key = tk.StringVar(value="")
@@ -183,12 +254,7 @@ class OcrDashboard(tb.Window):
         self.llm_timeout = tk.StringVar(value=str(DEFAULT_LLM_TIMEOUT_SECONDS))
         self.llm_retry_attempts = tk.StringVar(value=str(DEFAULT_LLM_RETRY_ATTEMPTS))
         self.llm_mode = tk.StringVar(value=LLM_MODE_RESPONSES)
-        self.llm_prompt = tk.StringVar(
-            value=(
-                "Extract all text from this PDF with high fidelity. "
-                "Return plain markdown optimized for RAG chunking with headings where meaningful."
-            )
-        )
+        self.llm_prompt = tk.StringVar(value=DEFAULT_LLM_PROMPT_TEXT)
         self.llm_update_paperless = tk.BooleanVar(value=False)
 
         self._add_form_row(llm_frame, 0, "LLM Base URL", self.llm_api_base_url)
@@ -196,7 +262,12 @@ class OcrDashboard(tb.Window):
         self._add_form_row(llm_frame, 2, "Model", self.llm_model)
         self._add_form_row(llm_frame, 3, "LLM Timeout (s)", self.llm_timeout)
         self._add_form_row(llm_frame, 4, "Retry attempts", self.llm_retry_attempts)
-        self._add_form_row(llm_frame, 5, "Prompt", self.llm_prompt)
+        tb.Label(llm_frame, text="Prompt").grid(row=5, column=0, sticky=W, padx=6, pady=4)
+        self.llm_prompt_text = tk.Text(llm_frame, height=4, wrap="word")
+        self.llm_prompt_text.grid(row=5, column=1, sticky="ew", padx=6, pady=4)
+        self.llm_prompt_text.insert("1.0", self.llm_prompt.get())
+        self.llm_prompt_text.edit_modified(False)
+        self.llm_prompt_text.bind("<<Modified>>", self._on_llm_prompt_text_modified)
 
         tb.Label(llm_frame, text="API mode").grid(row=6, column=0, sticky=W, padx=6, pady=4)
         tb.Combobox(
@@ -206,6 +277,14 @@ class OcrDashboard(tb.Window):
             state="readonly",
             width=22,
         ).grid(row=6, column=1, sticky=W, padx=6, pady=4)
+        api_mode_info = tb.Label(
+            llm_frame,
+            text="ⓘ",
+            bootstyle="info",
+            cursor="hand2",
+        )
+        api_mode_info.grid(row=6, column=2, sticky=W, padx=(0, 6), pady=4)
+        api_mode_info.bind("<Button-1>", lambda _event: self.show_llm_api_mode_info())
         tb.Checkbutton(
             llm_frame,
             text="Update Paperless content after successful LLM OCR",
@@ -213,6 +292,100 @@ class OcrDashboard(tb.Window):
             bootstyle="round-toggle",
         ).grid(row=7, column=1, sticky=W, padx=6, pady=4)
         llm_frame.columnconfigure(1, weight=1)
+
+        footer = tb.Frame(top)
+        footer.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        footer.columnconfigure(0, weight=1)
+        tb.Label(
+            footer,
+            text=(
+                f"Settings are auto-saved to {self.settings_file_path}. "
+                f"API keys are read/written via {DEFAULT_TOKEN_FILE} and {DEFAULT_LLM_KEY_FILE}."
+            ),
+            bootstyle="secondary",
+        ).grid(row=0, column=0, sticky=W, pady=(0, 8))
+        actions = tb.Frame(footer)
+        actions.grid(row=1, column=0, sticky=W)
+        tb.Button(
+            actions,
+            text="Save",
+            bootstyle="success",
+            command=self.save_settings_now,
+        ).pack(side=LEFT, padx=(0, 8))
+        tb.Button(
+            actions,
+            text="Clear settings",
+            bootstyle="danger-outline",
+            command=self.clear_settings,
+        ).pack(side=LEFT)
+
+    def show_llm_api_mode_info(self) -> None:
+        if self.llm_api_mode_help_window is not None and self.llm_api_mode_help_window.winfo_exists():
+            self.llm_api_mode_help_window.lift()
+            self.llm_api_mode_help_window.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        self.llm_api_mode_help_window = win
+        win.title("API mode help")
+        win.geometry("700x420")
+        win.minsize(560, 320)
+        win.transient(self)
+        win.grab_set()
+
+        outer = tb.Frame(win, padding=12)
+        outer.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            outer,
+            text="LLM API mode: what the two options mean",
+            bootstyle="primary",
+        ).pack(anchor=W, pady=(0, 8))
+
+        body = ScrolledText(outer, wrap="word", height=14)
+        body.pack(fill=BOTH, expand=True)
+        body.insert(
+            "1.0",
+            (
+                "responses\n"
+                "- Endpoint: /v1/responses\n"
+                "- Recommended default for modern OpenAI-compatible APIs.\n"
+                "- This mode sends structured input, including prompt text and PDF file data URL.\n"
+                "- Better fit for multimodal and newer response formats.\n\n"
+                "chat_completions\n"
+                "- Endpoint: /v1/chat/completions\n"
+                "- Compatibility mode for providers that still expose classic chat format.\n"
+                "- Prompt and PDF data are sent as chat message content.\n"
+                "- Useful fallback when /v1/responses is unsupported.\n\n"
+                "How to choose\n"
+                "- Start with responses.\n"
+                "- If your provider/model does not support it, switch to chat_completions."
+            ),
+        )
+        body.configure(state="disabled")
+
+        tb.Button(outer, text="Close", bootstyle="secondary", command=self._close_llm_api_mode_help).pack(
+            anchor="e",
+            pady=(8, 0),
+        )
+        win.protocol("WM_DELETE_WINDOW", self._close_llm_api_mode_help)
+
+    def _close_llm_api_mode_help(self) -> None:
+        if self.llm_api_mode_help_window is None:
+            return
+        if self.llm_api_mode_help_window.winfo_exists():
+            self.llm_api_mode_help_window.destroy()
+        self.llm_api_mode_help_window = None
+
+    def _build_rag_tab(self) -> None:
+        top = tb.Frame(self.tab_rag)
+        top.pack(fill=X)
+
+        tb.Label(
+            top,
+            text="RAG workflows and controls live here.",
+            bootstyle="secondary",
+        ).pack(anchor=W, pady=(0, 8))
 
         export_frame = tb.Labelframe(top, text="RAG Export", padding=8)
         export_frame.pack(fill=X)
@@ -265,29 +438,267 @@ class OcrDashboard(tb.Window):
         tb.Label(parent, text=label).grid(row=row, column=0, sticky=W, padx=6, pady=4)
         tb.Entry(parent, textvariable=variable, show=show).grid(row=row, column=1, sticky="ew", padx=6, pady=4)
 
-    def _build_run_tab(self) -> None:
-        controls = tb.Labelframe(self.tab_run, text="Step 1: Candidate Set", padding=8)
-        controls.pack(fill=X)
+    def _setting_string_vars(self) -> dict[str, tk.StringVar]:
+        return {
+            "api_base_url": self.api_base_url,
+            "page_size": self.page_size,
+            "timeout": self.timeout,
+            "llm_api_base_url": self.llm_api_base_url,
+            "llm_model": self.llm_model,
+            "llm_timeout": self.llm_timeout,
+            "llm_retry_attempts": self.llm_retry_attempts,
+            "llm_mode": self.llm_mode,
+            "llm_prompt": self.llm_prompt,
+            "export_root_dir": self.export_root_dir,
+            "export_source_mode": self.export_source_mode,
+            "export_format_mode": self.export_format_mode,
+            "batch_size": self.batch_size,
+            "recent_days": self.recent_days,
+            "prospective_threshold": self.prospective_threshold,
+            "prospective_recent_days": self.prospective_recent_days,
+            "pdf_query": self.pdf_query,
+            "pdf_modified_contains": self.pdf_modified_contains,
+            "pdf_exclude_recent_days": self.pdf_exclude_recent_days,
+            "pdf_min_chars": self.pdf_min_chars,
+            "pdf_max_chars": self.pdf_max_chars,
+            "pdf_min_pages": self.pdf_min_pages,
+            "pdf_max_pages": self.pdf_max_pages,
+            "ocr_engine_mode": self.ocr_engine_mode,
+            "paperless_fetch_status": self.paperless_fetch_status,
+            "success_sort_field": self.success_sort_field,
+            "success_sort_order": self.success_sort_order,
+        }
 
-        self.batch_size = tk.StringVar(value="50")
-        self.recent_days = tk.StringVar(value="14")
+    def _setting_bool_vars(self) -> dict[str, tk.BooleanVar]:
+        return {
+            "verify_tls": self.verify_tls,
+            "llm_update_paperless": self.llm_update_paperless,
+            "pdf_missing_archive_only": self.pdf_missing_archive_only,
+        }
+
+    def _settings_autosave_vars(self) -> list[tk.Variable]:
+        vars_to_watch = list(self._setting_string_vars().values())
+        vars_to_watch.extend(self._setting_bool_vars().values())
+        vars_to_watch.extend([self.api_token, self.llm_api_key])
+        return vars_to_watch
+
+    def _to_bool(self, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return False
+
+    def _default_string_settings(self) -> dict[str, str]:
+        return {
+            "api_base_url": DEFAULT_API_BASE_URL,
+            "page_size": "200",
+            "timeout": "30",
+            "llm_api_base_url": "https://api.openai.com",
+            "llm_model": "gpt-4.1-mini",
+            "llm_timeout": str(DEFAULT_LLM_TIMEOUT_SECONDS),
+            "llm_retry_attempts": str(DEFAULT_LLM_RETRY_ATTEMPTS),
+            "llm_mode": LLM_MODE_RESPONSES,
+            "llm_prompt": DEFAULT_LLM_PROMPT_TEXT,
+            "export_root_dir": str(self.rag_root_dir),
+            "export_source_mode": ENGINE_PAPERLESS,
+            "export_format_mode": "both",
+            "batch_size": "50",
+            "recent_days": "14",
+            "prospective_threshold": "120",
+            "prospective_recent_days": "14",
+            "pdf_query": "",
+            "pdf_modified_contains": "",
+            "pdf_exclude_recent_days": "0",
+            "pdf_min_chars": "",
+            "pdf_max_chars": "",
+            "pdf_min_pages": "",
+            "pdf_max_pages": "",
+            "ocr_engine_mode": ENGINE_PAPERLESS,
+            "paperless_fetch_status": "Paperless overview last fetched: never",
+            "success_sort_field": SUCCESS_SORT_FIELDS[0][0],
+            "success_sort_order": SUCCESS_SORT_ORDERS[0],
+        }
+
+    def _default_bool_settings(self) -> dict[str, bool]:
+        return {
+            "verify_tls": False,
+            "llm_update_paperless": False,
+            "pdf_missing_archive_only": False,
+        }
+
+    def _on_llm_prompt_text_modified(self, _event: object = None) -> None:
+        if not hasattr(self, "llm_prompt_text"):
+            return
+        if not self.llm_prompt_text.edit_modified():
+            return
+        self.llm_prompt_text.edit_modified(False)
+        prompt = self.llm_prompt_text.get("1.0", "end-1c")
+        if self.llm_prompt.get() != prompt:
+            self.llm_prompt.set(prompt)
+
+    def _set_llm_prompt_text_widget(self, prompt: str) -> None:
+        if not hasattr(self, "llm_prompt_text"):
+            return
+        current = self.llm_prompt_text.get("1.0", "end-1c")
+        if current == prompt:
+            return
+        self.llm_prompt_text.delete("1.0", END)
+        self.llm_prompt_text.insert("1.0", prompt)
+        self.llm_prompt_text.edit_modified(False)
+
+    def _delete_file_if_exists(self, path: Path) -> None:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as exc:
+            self._append_file_log(f"[WARN] Failed to delete file {path}: {exc}\n")
+
+    def save_settings_now(self) -> None:
+        if self._save_settings(show_error=True):
+            messagebox.showinfo("Settings saved", f"Saved settings to {self.settings_file_path}.")
+            self._emit(f"[INFO] Settings saved to {self.settings_file_path}\n")
+
+    def clear_settings(self) -> None:
+        confirmed = messagebox.askyesno(
+            "Clear settings",
+            (
+                "This resets settings to defaults and clears saved API keys.\n\n"
+                "Continue?"
+            ),
+        )
+        if not confirmed:
+            return
+
+        self._settings_load_in_progress = True
+        try:
+            string_defaults = self._default_string_settings()
+            for key, var in self._setting_string_vars().items():
+                var.set(string_defaults.get(key, ""))
+
+            bool_defaults = self._default_bool_settings()
+            for key, var in self._setting_bool_vars().items():
+                var.set(bool_defaults.get(key, False))
+
+            self.api_token.set("")
+            self.llm_api_key.set("")
+            self._set_llm_prompt_text_widget(self.llm_prompt.get())
+        finally:
+            self._settings_load_in_progress = False
+
+        self._delete_file_if_exists(self.settings_file_path)
+        self._delete_file_if_exists(DEFAULT_TOKEN_FILE)
+        self._delete_file_if_exists(DEFAULT_LLM_KEY_FILE)
+        self._delete_file_if_exists(LEGACY_LLM_KEY_FILE)
+        self._save_settings(show_error=False)
+        self._emit("[INFO] Cleared settings and reset to defaults.\n")
+        messagebox.showinfo("Settings cleared", "Settings reset to defaults and saved keys were removed.")
+
+    def _load_saved_settings(self) -> None:
+        self._settings_load_in_progress = True
+        try:
+            if self.settings_file_path.exists():
+                raw = self.settings_file_path.read_text(encoding="utf-8").strip()
+                if raw:
+                    payload = json.loads(raw)
+                    if not isinstance(payload, dict):
+                        raise RuntimeError("Settings file content is not a JSON object")
+                    for key, var in self._setting_string_vars().items():
+                        if key not in payload:
+                            continue
+                        value = payload.get(key)
+                        if value is None:
+                            continue
+                        var.set(str(value))
+                    for key, var in self._setting_bool_vars().items():
+                        if key not in payload:
+                            continue
+                        var.set(self._to_bool(payload.get(key)))
+
+            if not self.api_token.get().strip():
+                token = read_token_file(DEFAULT_TOKEN_FILE)
+                if token:
+                    self.api_token.set(token)
+
+            if not self.llm_api_key.get().strip():
+                llm_key = read_token_file(DEFAULT_LLM_KEY_FILE)
+                if not llm_key:
+                    llm_key = read_token_file(LEGACY_LLM_KEY_FILE)
+                if llm_key:
+                    self.llm_api_key.set(llm_key)
+            self._set_llm_prompt_text_widget(self.llm_prompt.get())
+        except Exception as exc:
+            self._append_file_log(f"[WARN] Failed to load dashboard settings: {exc}\n")
+        finally:
+            self._settings_load_in_progress = False
+
+    def _register_settings_autosave(self) -> None:
+        for var in self._settings_autosave_vars():
+            var.trace_add("write", self._schedule_settings_autosave)
+
+    def _schedule_settings_autosave(self, *_: object) -> None:
+        if self._settings_load_in_progress:
+            return
+        if self._settings_autosave_after_id is not None:
+            try:
+                self.after_cancel(self._settings_autosave_after_id)
+            except Exception:
+                pass
+        self._settings_autosave_after_id = self.after(
+            SETTINGS_AUTOSAVE_DELAY_MS,
+            self._save_settings_autosave_callback,
+        )
+
+    def _save_settings_autosave_callback(self) -> None:
+        self._settings_autosave_after_id = None
+        self._save_settings(show_error=False)
+
+    def _write_secret_file(self, path: Path, secret: str) -> None:
+        value = (secret or "").strip()
+        if not value:
+            return
+        try:
+            current = read_token_file(path)
+        except OSError:
+            current = ""
+        if current == value:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value + "\n", encoding="utf-8")
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            self._append_file_log(f"[WARN] Failed to write secret file {path}: {exc}\n")
+
+    def _save_settings(self, show_error: bool = False) -> bool:
+        try:
+            payload: dict[str, str | bool] = {}
+            for key, var in self._setting_string_vars().items():
+                payload[key] = var.get()
+            for key, var in self._setting_bool_vars().items():
+                payload[key] = bool(var.get())
+
+            self.settings_file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.settings_file_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._write_secret_file(DEFAULT_TOKEN_FILE, self.api_token.get())
+            self._write_secret_file(DEFAULT_LLM_KEY_FILE, self.llm_api_key.get())
+            return True
+        except Exception as exc:
+            if show_error:
+                messagebox.showerror("Save settings failed", str(exc))
+            self._append_file_log(f"[WARN] Failed to save dashboard settings: {exc}\n")
+            return False
+
+    def _build_run_tab(self) -> None:
         self.ocr_engine_mode = tk.StringVar(value=ENGINE_PAPERLESS)
 
-        tb.Label(controls, text="Batch size").pack(side=LEFT, padx=(0, 6))
-        tb.Combobox(controls, values=BATCH_OPTIONS, textvariable=self.batch_size, state="readonly", width=8).pack(
-            side=LEFT, padx=(0, 12)
-        )
-        tb.Label(controls, text="Exclude OCR in last days").pack(side=LEFT, padx=(0, 6))
-        tb.Entry(controls, textvariable=self.recent_days, width=8).pack(side=LEFT, padx=(0, 12))
-        tb.Button(controls, text="Refresh All Data", bootstyle="primary", command=self.refresh_all).pack(
-            side=LEFT, padx=(0, 8)
-        )
-        tb.Button(controls, text="Refresh Candidates", bootstyle="info", command=self.refresh_candidates).pack(
-            side=LEFT, padx=(0, 8)
-        )
-
         run_actions = tb.Labelframe(self.tab_run, text="Step 2: OCR + Export", padding=8)
-        run_actions.pack(fill=X, pady=(8, 6))
+        run_actions.pack(fill=X, pady=(0, 6))
 
         tb.Label(run_actions, text="OCR engine").pack(side=LEFT, padx=(0, 6))
         tb.Combobox(
@@ -390,24 +801,6 @@ class OcrDashboard(tb.Window):
             headings=("Timestamp", "Doc ID", "Title", "Action", "Engine", "Status", "Paperless update", "MD", "JSON"),
         )
 
-    def _build_low_text_tab(self) -> None:
-        controls = tb.Frame(self.tab_low)
-        controls.pack(fill=X)
-
-        self.low_threshold = tk.StringVar(value="100")
-        tb.Label(controls, text="Suspicious if chars <").pack(side=LEFT, padx=(0, 6))
-        tb.Entry(controls, textvariable=self.low_threshold, width=8).pack(side=LEFT, padx=(0, 12))
-        tb.Button(controls, text="Refresh Low Text", command=self.refresh_low_text, bootstyle="info").pack(side=LEFT)
-
-        self.low_summary = tk.StringVar(value="No data loaded")
-        tb.Label(self.tab_low, textvariable=self.low_summary, bootstyle="secondary").pack(anchor=W, pady=(8, 6))
-
-        self.low_tree = self._build_tree(
-            self.tab_low,
-            columns=("id", "title", "content_length", "page_count", "modified"),
-            headings=("ID", "Title", "Chars", "Pages", "Modified"),
-        )
-
     def _build_success_tab(self) -> None:
         controls = tb.Frame(self.tab_success)
         controls.pack(fill=X, pady=(0, 6))
@@ -417,6 +810,31 @@ class OcrDashboard(tb.Window):
             bootstyle="info",
             command=self.refresh_success_history_only,
         ).pack(side=LEFT)
+
+        self.success_sort_field = tk.StringVar(value=SUCCESS_SORT_FIELDS[0][0])
+        self.success_sort_order = tk.StringVar(value=SUCCESS_SORT_ORDERS[0])
+
+        tb.Label(controls, text="Sort by").pack(side=LEFT, padx=(12, 6))
+        success_sort_field_box = tb.Combobox(
+            controls,
+            values=tuple(label for label, _ in SUCCESS_SORT_FIELDS),
+            textvariable=self.success_sort_field,
+            state="readonly",
+            width=14,
+        )
+        success_sort_field_box.pack(side=LEFT, padx=(0, 12))
+        success_sort_field_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_success_tab())
+
+        tb.Label(controls, text="Order").pack(side=LEFT, padx=(0, 6))
+        success_sort_order_box = tb.Combobox(
+            controls,
+            values=SUCCESS_SORT_ORDERS,
+            textvariable=self.success_sort_order,
+            state="readonly",
+            width=12,
+        )
+        success_sort_order_box.pack(side=LEFT)
+        success_sort_order_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_success_tab())
 
         self.success_summary = tk.StringVar(value="No data loaded")
         tb.Label(self.tab_success, textvariable=self.success_summary, bootstyle="secondary").pack(anchor=W, pady=(0, 6))
@@ -506,7 +924,7 @@ class OcrDashboard(tb.Window):
         tb.Label(filters_row_2, text="Pages max").pack(side=LEFT, padx=(0, 6))
         tb.Entry(filters_row_2, textvariable=self.pdf_max_pages, width=8).pack(side=LEFT, padx=(0, 12))
 
-        tb.Button(filters_row_2, text="Search PDFs", command=self.refresh_pdf_search, bootstyle="info").pack(
+        tb.Button(filters_row_2, text="Search Documents", command=self.refresh_pdf_search, bootstyle="info").pack(
             side=LEFT, padx=(0, 8)
         )
         tb.Button(filters_row_2, text="Reset Filters", command=self.reset_pdf_search_filters, bootstyle="secondary").pack(
@@ -598,6 +1016,24 @@ class OcrDashboard(tb.Window):
             tree.move(item_id, "", index)
         sort_state[column] = not ascending
         self.tree_sort_state[str(tree)] = sort_state
+
+    def _selected_success_sort_key(self) -> str:
+        selected = self.success_sort_field.get().strip()
+        for label, key in SUCCESS_SORT_FIELDS:
+            if selected == label:
+                return key
+        return "run_ts"
+
+    def _success_row_sort_key(self, row: dict, field: str):
+        if field == "run_ts":
+            parsed = self._parse_run_ts_to_dt(str(row.get("run_ts", "")))
+            return parsed if parsed is not None else dt.datetime.min
+        if field in {"id", "pre_content_length", "post_content_length", "content_delta"}:
+            try:
+                return int(str(row.get(field, "")).strip())
+            except ValueError:
+                return -1
+        return str(row.get(field, "")).lower()
 
     def _emit(self, msg: str) -> None:
         self._append_file_log(msg)
@@ -780,6 +1216,7 @@ class OcrDashboard(tb.Window):
     def _get_token(self) -> str:
         typed = self.api_token.get().strip()
         if typed:
+            self._write_secret_file(DEFAULT_TOKEN_FILE, typed)
             return typed
 
         env_token = os.environ.get("PAPERLESS_API_TOKEN", "").strip()
@@ -980,6 +1417,7 @@ class OcrDashboard(tb.Window):
     def _get_llm_api_key(self) -> str:
         typed = self.llm_api_key.get().strip()
         if typed:
+            self._write_secret_file(DEFAULT_LLM_KEY_FILE, typed)
             return typed
         env_token = os.environ.get("OPENAI_API_KEY", "").strip()
         if env_token:
@@ -1379,6 +1817,7 @@ class OcrDashboard(tb.Window):
             return
 
         self._emit("\n=== DATA REFRESH START ===\n")
+        self.paperless_fetch_status.set("Paperless overview last fetched: fetching...")
 
         def worker() -> None:
             try:
@@ -1406,13 +1845,16 @@ class OcrDashboard(tb.Window):
                 self._emit(f"Loaded failed_rows={len(self.failed_rows)}\n")
 
                 self.after(0, self.refresh_candidates)
-                self.after(0, self.refresh_low_text)
                 self.after(0, self.refresh_success_tab)
                 self.after(0, self.refresh_prospective)
                 self.after(0, self.refresh_pdf_search)
                 self.after(0, self.refresh_pipeline_overview)
+                ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.after(0, self.paperless_fetch_status.set, f"Paperless overview last fetched: {ts}")
                 self._emit("=== DATA REFRESH END ===\n")
             except Exception as exc:
+                ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.after(0, self.paperless_fetch_status.set, f"Paperless overview fetch failed: {ts}")
                 self._emit(f"[ERROR] Refresh failed: {exc}\n")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1506,7 +1948,7 @@ class OcrDashboard(tb.Window):
 
     def refresh_candidates(self) -> None:
         if not self.docs:
-            self.run_summary.set("No documents loaded. Click Refresh All Data.")
+            self.run_summary.set("No documents loaded. Click 'Fetch overview from Paperless'.")
             self._fill_tree(self.run_tree, [])
             return
 
@@ -1525,41 +1967,22 @@ class OcrDashboard(tb.Window):
         selected = candidates[:batch_size]
         self._set_run_candidates(
             selected,
-            f"Candidates built: {len(selected)} selected from {len(self.docs)} docs (excluded recent manual OCR IDs: {len(recent_ids)})"
+            (
+                "Candidates rebuilt from loaded overview: "
+                f"{len(selected)} selected from {len(self.docs)} docs "
+                f"(excluded recent manual OCR IDs: {len(recent_ids)})"
+            )
         )
 
-    def refresh_low_text(self) -> None:
-        if not self.docs:
-            self.low_summary.set("No documents loaded. Click Refresh All Data.")
-            self._fill_tree(self.low_tree, [])
-            return
-
-        try:
-            threshold = self._safe_int(self.low_threshold.get().strip(), "Low-text threshold", minimum=0)
-        except ValueError as exc:
-            messagebox.showerror("Invalid input", str(exc))
-            return
-
-        low = [d for d in self.docs if int(d.get("content_length") or 0) < threshold]
-        low.sort(key=lambda d: (int(d.get("content_length") or 0), int(d.get("id") or 0)))
-        self.low_text_rows = low
-
-        rows = [
-            (
-                int(d.get("id") or 0),
-                d.get("title") or "",
-                int(d.get("content_length") or 0),
-                d.get("page_count") if d.get("page_count") is not None else "",
-                d.get("modified") or "",
-            )
-            for d in low
-        ]
-        self._fill_tree(self.low_tree, rows)
-        self.low_summary.set(f"Suspicious low-text objects: {len(low)} (threshold={threshold})")
-
     def refresh_success_tab(self) -> None:
+        sort_field = self._selected_success_sort_key()
+        descending = self.success_sort_order.get() == SUCCESS_SORT_ORDERS[0]
         rows = []
-        for row in sorted(self.success_rows, key=lambda r: str(r.get("run_ts", "")), reverse=True):
+        for row in sorted(
+            self.success_rows,
+            key=lambda r: self._success_row_sort_key(r, sort_field),
+            reverse=descending,
+        ):
             rows.append(
                 (
                     row.get("run_ts", ""),
@@ -1646,7 +2069,7 @@ class OcrDashboard(tb.Window):
 
     def refresh_prospective(self) -> None:
         if not self.docs:
-            self.prospective_summary.set("No documents loaded. Click Refresh All Data.")
+            self.prospective_summary.set("No documents loaded. Click 'Fetch overview from Paperless'.")
             self._fill_tree(self.prospective_tree, [])
             return
 
@@ -1808,8 +2231,6 @@ class OcrDashboard(tb.Window):
             selected_doc_ids = self._selected_ids_from_tree(self.pdf_tree, id_col_index=0)
         elif current_tab is self.tab_prospective:
             selected_doc_ids = self._selected_ids_from_tree(self.prospective_tree, id_col_index=0)
-        elif current_tab is self.tab_low:
-            selected_doc_ids = self._selected_ids_from_tree(self.low_tree, id_col_index=0)
         elif current_tab is self.tab_success:
             selected_doc_ids = self._selected_ids_from_tree(self.success_tree, id_col_index=1)
         else:
@@ -1823,8 +2244,7 @@ class OcrDashboard(tb.Window):
                     "Select rows in one of these tabs first:\n"
                     "- Pipeline Run\n"
                     "- Pipeline Overview\n"
-                    "- Search PDFs\n"
-                    "- Low-Text Review\n"
+                    "- Search Documents\n"
                     "- Prospective Reruns\n"
                     "- OCR History"
                 ),
@@ -1835,13 +2255,13 @@ class OcrDashboard(tb.Window):
     def export_pdf_search_selected_to_rag(self) -> None:
         selected_doc_ids = self._selected_ids_from_tree(self.pdf_tree, id_col_index=0)
         if not selected_doc_ids:
-            messagebox.showinfo("No selection", "Select one or more rows in Search PDFs first.")
+            messagebox.showinfo("No selection", "Select one or more rows in Search Documents first.")
             return
         self._export_documents_to_rag(selected_doc_ids)
 
     def export_selected_to_rag(self) -> None:
         if not self.docs:
-            messagebox.showinfo("No data", "No documents loaded. Click Refresh All Data.")
+            messagebox.showinfo("No data", "No documents loaded. Click 'Fetch overview from Paperless'.")
             return
         selected_doc_ids = self._selected_run_doc_ids()
         if not selected_doc_ids:
@@ -2012,7 +2432,7 @@ class OcrDashboard(tb.Window):
 
     def refresh_pdf_search(self) -> None:
         if not self.docs:
-            self.pdf_summary.set("No documents loaded. Click Refresh All Data.")
+            self.pdf_summary.set("No documents loaded. Click 'Fetch overview from Paperless'.")
             self._fill_tree(self.pdf_tree, [])
             self.pdf_search_rows = []
             return
@@ -2048,10 +2468,10 @@ class OcrDashboard(tb.Window):
             else set()
         )
 
-        pdf_docs = [d for d in self.docs if str(d.get("mime_type") or "").lower() == "application/pdf"]
+        docs_to_search = list(self.docs)
         filtered: list[dict] = []
 
-        for d in pdf_docs:
+        for d in docs_to_search:
             doc_id = int(d.get("id") or 0)
             if recent_ids and doc_id in recent_ids:
                 continue
@@ -2126,8 +2546,8 @@ class OcrDashboard(tb.Window):
         ]
         self._fill_tree(self.pdf_tree, rows)
         self.pdf_summary.set(
-            "PDF results: "
-            f"{len(filtered)} of {len(pdf_docs)} PDF docs "
+            "Search results: "
+            f"{len(filtered)} of {len(docs_to_search)} documents "
             f"(exclude_recent_days={exclude_recent_days})"
         )
 
@@ -2150,14 +2570,14 @@ class OcrDashboard(tb.Window):
             )
             return
         if not self.docs:
-            messagebox.showinfo("No data", "No documents loaded. Click Refresh All Data.")
+            messagebox.showinfo("No data", "No documents loaded. Click 'Fetch overview from Paperless'.")
             return
 
         selected_items = self.pdf_tree.selection()
         if not selected_items:
             messagebox.showinfo(
                 "No selection",
-                "Select one or more rows in Search PDFs first.",
+                "Select one or more rows in Search Documents first.",
             )
             return
 
@@ -2183,16 +2603,16 @@ class OcrDashboard(tb.Window):
                 transfer_docs.append(doc)
 
         if not transfer_docs:
-            messagebox.showinfo("Not found", "Selected IDs were not found in current PDF search result.")
+            messagebox.showinfo("Not found", "Selected IDs were not found in current Search Documents result.")
             return
 
         self._set_run_candidates(
             transfer_docs,
-            f"Transferred {len(transfer_docs)} document(s) from Search PDFs.",
+            f"Transferred {len(transfer_docs)} document(s) from Search Documents.",
         )
         self.notebook.select(self.tab_run)
         self._emit(
-            f"[INFO] Transferred to Run OCR from Search PDFs: ids={','.join(str(d['id']) for d in transfer_docs)}\n"
+            f"[INFO] Transferred to Run OCR from Search Documents: ids={','.join(str(d['id']) for d in transfer_docs)}\n"
         )
 
     def transfer_prospective_to_run(self) -> None:
@@ -2203,7 +2623,7 @@ class OcrDashboard(tb.Window):
             )
             return
         if not self.docs:
-            messagebox.showinfo("No data", "No documents loaded. Click Refresh All Data.")
+            messagebox.showinfo("No data", "No documents loaded. Click 'Fetch overview from Paperless'.")
             return
 
         selected_items = self.prospective_tree.selection()
@@ -2294,7 +2714,7 @@ class OcrDashboard(tb.Window):
         if not run_docs:
             messagebox.showerror(
                 "Selection error",
-                "Selected rows could not be resolved to loaded candidates. Refresh candidates and try again.",
+                "Selected rows could not be resolved to loaded candidates. Rebuild candidates and try again.",
             )
             return
         if missing_doc_ids:
@@ -2721,6 +3141,16 @@ class OcrDashboard(tb.Window):
         if self.export_active:
             self._emit("Stop requested. Current export job will stop shortly.\n")
         self._render_progress()
+
+    def _on_window_close(self) -> None:
+        if self._settings_autosave_after_id is not None:
+            try:
+                self.after_cancel(self._settings_autosave_after_id)
+            except Exception:
+                pass
+            self._settings_autosave_after_id = None
+        self._save_settings(show_error=False)
+        self.destroy()
 
 
 if __name__ == "__main__":
